@@ -7,6 +7,9 @@
     :license: BSD, see LICENSE for more details
 
 '''
+import requests
+from lxml import etree, objectify
+from lxml.builder import E
 from authorize import AuthorizeClient, CreditCard, Address, \
     AuthorizeResponseError, AuthorizeInvalidError
 from authorize.client import AuthorizeCreditCard
@@ -73,6 +76,10 @@ class AuthorizeNetTransaction:
     Implement the authorize and capture methods
     """
     __name__ = 'payment_gateway.transaction'
+
+    authorize_status = fields.Char(
+        'Authorize.net Transaction Status', readonly=True
+    )
 
     def authorize_authorize_net(self, card_info=None):
         """
@@ -187,8 +194,81 @@ class AuthorizeNetTransaction:
     def update_authorize_net(self):
         """
         Update the status of the transaction from Authorize.net
+
+
+        ..warning::
+
+            Do not call this method in the same transaction of a request. While
+            other methods are carefully designed to avoid rollbacks, this
+            method raises exceptions that it encounters. Unless the calling
+            method safely suppresses them, this method is likely to cause you
+            trouble.
+
+        The authorizesauce python package does not provide a transaction detail
+        lookup API. Hence this once is implemented using the requests library
+        and lxml.
+
+        More details of this API can be seen in the URL below:
+
+            http://www.authorize.net/support/ReportingGuide_XML.pdf
+
+        Note that the status API is not available by default. It needs to be
+        manually enabled. Read more on this wiki:
         """
-        raise self.raise_user_error('feature_not_available')
+        request_body = E.getTransactionDetailsRequest(
+            E.merchantAuthentication(
+                E.name(self.gateway.authorize_net_login),
+                E.transactionKey(self.gateway.authorize_net_transaction_key),
+            ),
+            E.transId(self.provider_reference),
+            xmlns="AnetApi/xml/v1/schema/AnetApiSchema.xsd"
+        )
+
+        # Identify the URL based on test/production environment
+        if self.gateway.test:
+            url = 'https://apitest.authorize.net/xml/v1/request.api'
+        else:
+            url = 'https://api.authorize.net/xml/v1/request.api'
+
+        try:
+            result = requests.post(
+                url, data=etree.tostring(request_body),
+                headers={'Content-Type', 'text/xml'}
+            )
+        except requests.exceptions.RequestException, exc:
+            self.raise_user_error(*exc.args)
+
+        response = objectify.fromstring(result.content)
+
+        if response.messages.resultCode != 'OK':
+            # Raise an exception if the server responded with an error
+            messages = '\n'.join([
+                '%s: %s' % (msg.code, msg.text)
+                for msg in response.messages.message
+            ])
+            self.raise_user_error(messages)
+
+        # Handle the response and update the payment transaction
+        transaction = response.transaction
+
+        # The transaction status returned by authorize.net
+        self.authorize_status = transaction.transactionStatus.pyval
+
+        if transaction.responseCode.pyval in (2, 3):
+            # 2 = declined
+            # 3 = Error
+            self.state = 'failed'
+        elif transaction.responseCode.pyval == 4:
+            # 4 = Held for review
+            self.state = 'in-progress'
+        elif transaction.responseCode.pyval == 1:
+            # 1 = Approved
+            if self.authorize_status == 'authorizedPendingCapture':
+                self.state = 'authorized'
+            elif self.authorize_status == 'capturedPendingSettlement':
+                self.state = 'completed'
+            elif self.authorize_status == 'voided'
+        self.save()
 
     def cancel_authorize_net(self):
         """

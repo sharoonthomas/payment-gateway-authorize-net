@@ -30,6 +30,7 @@ minor_version = int(minor_version)
 
 requires = [
     'AuthorizeSauce',
+    'requests',
 ]
 
 MODULE = 'payment_gateway_authorize_net'
